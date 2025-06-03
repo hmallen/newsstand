@@ -125,22 +125,26 @@ def original_link(entry: dict) -> str:
     if "news.google." not in link:
         return link
 
-    # 1. If <source> element exists, use it
-    src = entry.get("source")
-    if src and isinstance(src, dict) and src.get("href"):
-        return src["href"]
-
-    # 2. Check for url= param in query string
+    # First try to extract the full article URL from the query string parameter 'url'
     parsed = urlparse(link)
     qs = parse_qs(parsed.query)
     if "url" in qs:
         return unquote(qs["url"][0])
 
-    # 3. Some GN links embed the URL after the last comma
+    # Next, try to extract the URL embedded after the last comma
     if "," in link:
         tail = link.rsplit(",", 1)[-1]
         if tail.startswith("https://"):
             return tail
+
+    # Finally, fall back to the 'source' element if provided and appears to be an article URL
+    src = entry.get("source")
+    if src and isinstance(src, dict) and src.get("href"):
+        candidate = src["href"]
+        parsed_candidate = urlparse(candidate)
+        # If the candidate URL has a nontrivial path, assume it's the full article URL
+        if parsed_candidate.path not in ["", "/"]:
+            return candidate
 
     return link  # fallback
 
@@ -226,6 +230,7 @@ def main():
 
                     title = entry.get("title", "(no title)")
                     link = original_link(entry)
+                    logging.info("Found: %s (%s)", title, link)
 
                     message = f"*{title}*\n{link}\n• topics: {', '.join(topics)}"
                     try:
