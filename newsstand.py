@@ -126,7 +126,7 @@ def original_link(entry: dict) -> str:
         if "news.google." not in link:
             return link
 
-        decoded_url = gnewsdecoder(link)
+        decoded_url = gnewsdecoder(link, interval=1)
         if decoded_url.get("status"):
             return decoded_url["decoded_url"]
 
@@ -197,7 +197,7 @@ def main():
 
     seen = load_seen()
     logging.info("Loaded %d GUIDs", len(seen))
-    
+
     while True:
         try:
             for feed_url in FEEDS:
