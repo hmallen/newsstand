@@ -32,6 +32,7 @@ from urllib.parse import urlparse, parse_qs, unquote
 from dotenv import load_dotenv
 import feedparser
 import requests
+from googlenewsdecoder import gnewsdecoder
 
 # UTF-8 stdout for logs
 sys.stdout.reconfigure(encoding="utf-8")
@@ -120,33 +121,21 @@ def article_matches(entry: dict) -> Tuple[bool, List[str]]:
 # -- Google News link extraction ------------------------------------
 
 def original_link(entry: dict) -> str:
-    """Return canonical link, stripping Google News redirect when needed."""
-    link = entry.get("link", "")
-    if "news.google." not in link:
-        return link
+    try:
+        link = entry.get("link", "")
+        if "news.google." not in link:
+            return link
 
-    # First try to extract the full article URL from the query string parameter 'url'
-    parsed = urlparse(link)
-    qs = parse_qs(parsed.query)
-    if "url" in qs:
-        return unquote(qs["url"][0])
+        decoded_url = gnewsdecoder(link)
+        if decoded_url.get("status"):
+            return decoded_url["decoded_url"]
 
-    # Next, try to extract the URL embedded after the last comma
-    if "," in link:
-        tail = link.rsplit(",", 1)[-1]
-        if tail.startswith("https://"):
-            return tail
+        logging.error("Error:", str(decoded_url["message"]))
+        return entry.get("link", "")
+    except Exception as e:
+        logging.error("Error decoding URL:", e)
+        return entry.get("link", "")
 
-    # Finally, fall back to the 'source' element if provided and appears to be an article URL
-    src = entry.get("source")
-    if src and isinstance(src, dict) and src.get("href"):
-        candidate = src["href"]
-        parsed_candidate = urlparse(candidate)
-        # If the candidate URL has a nontrivial path, assume it's the full article URL
-        if parsed_candidate.path not in ["", "/"]:
-            return candidate
-
-    return link  # fallback
 
 # ------------------------------------------------------------------
 # 4. SLACK POSTER
@@ -201,14 +190,14 @@ POST = post_via_bot_token if SLACK_BOT_TOKEN else post_via_webhook
 # ------------------------------------------------------------------
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(message)s")
 
     if not (SLACK_WEBHOOK_URL or SLACK_BOT_TOKEN):
         raise RuntimeError("Configure SLACK_WEBHOOK_URL or bot credentials.")
 
     seen = load_seen()
     logging.info("Loaded %d GUIDs", len(seen))
-
+    
     while True:
         try:
             for feed_url in FEEDS:
