@@ -1,12 +1,22 @@
 """
-news_monitor.py – Real‑time surveillance‑news watcher
+news_monitor.py – Real-time surveillance-news watcher
 ---------------------------------------------------
 Watches a list of news RSS/Atom feeds, scores fresh items for
-surveillance‑camera / ALPR / AI‑policing themes, and posts matching links
-into a Slack channel via Incoming Webhook.
+surveillance-camera / ALPR / AI-policing themes, and posts matching links
+into a Slack channel.  One message per link with rich preview, title,
+and topic tags.
 
-Python-3.11+.  No DB.  No cloud.  Drop it on a box, give it a webhook,
-run it with systemd or cron.
+Google News quirk: RSS items point back to *news.google.com* redirection
+URLs.  We now strip those and replace them with the canonical source
+URL to avoid extra hops and preview glitches.
+
+Two delivery modes:
+  1. **Incoming Webhook** – set `SLACK_WEBHOOK_URL`.
+  2. **Bot token via chat.postMessage** – set `SLACK_BOT_TOKEN` *and*
+     `SLACK_CHANNEL_ID` (guaranteed link unfurls).
+
+Python 3.11+.  Required libs:
+  pip install feedparser requests python-dotenv
 """
 from __future__ import annotations
 import os
@@ -16,38 +26,44 @@ import time
 import logging
 from pathlib import Path
 from typing import List, Dict, Tuple
+import sys
+from urllib.parse import urlparse, parse_qs, unquote
 
-import feedparser   # pip install feedparser
-import requests     # pip install requests
 from dotenv import load_dotenv
+import feedparser
+import requests
 
-# ---------------------------------------------------------------------------
-# 1. Configuration
-# ---------------------------------------------------------------------------
-# Slack Webhook – create one in Slack → Apps & Integrations → Incoming Webhooks
-load_dotenv()  # Loads variables from a .env file into process environment
+# UTF-8 stdout for logs
+sys.stdout.reconfigure(encoding="utf-8")
 
-SLACK_WEBHOOK_URL: str | None = os.getenv("SLACK_WEBHOOK_URL")  # required
-SLACK_USERNAME: str = os.getenv("SLACK_USERNAME", "newsstand")
-SLACK_ICON_EMOJI: str = os.getenv("SLACK_ICON_EMOJI", ":newspaper:")
-POLL_INTERVAL: int = int(os.getenv("POLL_INTERVAL", 300))  # seconds
-SEEN_FILE: Path = Path(os.getenv("SEEN_FILE", "seen.json"))
+# ------------------------------------------------------------------
+# 1. CONFIGURATION
+# ------------------------------------------------------------------
+load_dotenv()
 
-# News feeds likely to carry policing‑tech & surveillance stories
+SLACK_WEBHOOK_URL: str | None = os.getenv("SLACK_WEBHOOK_URL")
+SLACK_BOT_TOKEN: str | None   = os.getenv("SLACK_BOT_TOKEN")
+SLACK_CHANNEL_ID: str | None  = os.getenv("SLACK_CHANNEL_ID")
+SLACK_USERNAME: str           = os.getenv("SLACK_USERNAME", "news-bot")
+SLACK_ICON_EMOJI: str         = os.getenv("SLACK_ICON_EMOJI", ":police_car:")
+POLL_INTERVAL: int            = int(os.getenv("POLL_INTERVAL", 300))
+SEEN_FILE: Path               = Path(os.getenv("SEEN_FILE", "seen.json"))
+
 FEEDS: List[str] = [
-    "https://www.404media.co/feed",                  # 404 Media (tech & policy)
-    "https://www.theguardian.com/us/rss",            # Guardian US
-    "https://feeds.feedburner.com/policeone/all",    # Police1
-    "https://www.govtech.com/rss",                   # Government Technology
-    "https://qz.com/feed",                           # Quartz
-    "https://knowridge.com/feed/",                   # Knowridge (sci/tech)
+    "https://www.404media.co/feed",
+    "https://www.theguardian.com/us/rss",
+    "https://feeds.feedburner.com/policeone/all",
+    "https://www.govtech.com/rss",
+    "https://qz.com/feed",
+    "https://knowridge.com/feed/",
+    "https://www.ground.news/rss",
+    "https://news.google.com/rss/search?q=surveillance+OR+ALPR+OR+AI+law+enforcement&hl=en-US&gl=US&ceid=US:en",
 ]
 
-# ---------------------------------------------------------------------
-# 2. TOPIC FEATURE BANK – *focus narrowed as requested*
-# ---------------------------------------------------------------------
+# ------------------------------------------------------------------
+# 2. TOPIC FEATURE BANK
+# ------------------------------------------------------------------
 FEATURES: Dict[str, List[str]] = {
-    # Surveillance cameras in general
     "camera_surveillance": [
         r"\bsurveillance\s+cameras?\b",
         r"public\s+safety\s+cameras?",
@@ -55,7 +71,6 @@ FEATURES: Dict[str, List[str]] = {
         r"video\s+analytics",
         r"cctv", r"closed\s*circuit\s+television",
     ],
-    # Automatic/AI license‑plate recognition
     "alpr": [
         r"\balpr\b",
         r"automatic\s+license\s+plate",
@@ -65,9 +80,8 @@ FEATURES: Dict[str, List[str]] = {
         #r"flock\s+safety",
         #r"flock\s+nova",
     ],
-    # AI or ML explicitly tied to policing / investigations
     "ai_policing": [
-        r"ai‑enabled\s+(camera|surveillance|polic(ing|e))",
+        r"ai-enabled\s+(camera|surveillance|polic(ing|e))",
         r"machine\s+learning\s+(camera|surveillance|polic(ing|e))",
         r"predictive\s+policing",
         r"algorithmic\s+policing",
@@ -75,21 +89,18 @@ FEATURES: Dict[str, List[str]] = {
         r"law\s+enforcement[^\n]{0,60}?\bAI\b",
     ],
 }
+FEATURE_PATTERNS = {k: [re.compile(p, re.I) for p in v] for k, v in FEATURES.items()}
 
-FEATURE_PATTERNS: Dict[str, List[re.Pattern]] = {
-    k: [re.compile(p, re.I) for p in pats] for k, pats in FEATURES.items()
-}
-
-# ---------------------------------------------------------------------
+# ------------------------------------------------------------------
 # 3. UTILITIES
-# ---------------------------------------------------------------------
+# ------------------------------------------------------------------
 
 def load_seen() -> set[str]:
     if SEEN_FILE.exists():
         try:
             return set(json.loads(SEEN_FILE.read_text()))
         except Exception:
-            logging.warning("Seen‑file unreadable; starting fresh.")
+            logging.warning("Seen file unreadable; starting fresh.")
     return set()
 
 def save_seen(seen: set[str]):
@@ -106,53 +117,133 @@ def article_matches(entry: dict) -> Tuple[bool, List[str]]:
             hits.append(topic)
     return bool(hits), hits
 
-def post_to_slack(message: str):
-    payload = {"username": SLACK_USERNAME, "icon_emoji": SLACK_ICON_EMOJI, "text": message}
-    r = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10)
+# -- Google News link extraction ------------------------------------
+
+def original_link(entry: dict) -> str:
+    """Return canonical link, stripping Google News redirect when needed."""
+    link = entry.get("link", "")
+    if "news.google." not in link:
+        return link
+
+    # 1. If <source> element exists, use it
+    src = entry.get("source")
+    if src and isinstance(src, dict) and src.get("href"):
+        return src["href"]
+
+    # 2. Check for url= param in query string
+    parsed = urlparse(link)
+    qs = parse_qs(parsed.query)
+    if "url" in qs:
+        return unquote(qs["url"][0])
+
+    # 3. Some GN links embed the URL after the last comma
+    if "," in link:
+        tail = link.rsplit(",", 1)[-1]
+        if tail.startswith("https://"):
+            return tail
+
+    return link  # fallback
+
+# ------------------------------------------------------------------
+# 4. SLACK POSTER
+# ------------------------------------------------------------------
+
+def post_via_webhook(message: str):
+    if not SLACK_WEBHOOK_URL:
+        raise RuntimeError("SLACK_WEBHOOK_URL not set; cannot use webhook mode.")
+    payload = {
+        "username": SLACK_USERNAME,
+        "icon_emoji": SLACK_ICON_EMOJI,
+        "text": message,
+        "unfurl_links": True,
+        "unfurl_media": True,
+    }
+    r = requests.post(
+        SLACK_WEBHOOK_URL,
+        headers={"Content-Type": "application/json"},
+        data=json.dumps(payload).encode(),
+        timeout=10,
+    )
     r.raise_for_status()
 
-# ---------------------------------------------------------------------
-# 4. MAIN LOOP
-# ---------------------------------------------------------------------
+def post_via_bot_token(message: str):
+    if not (SLACK_BOT_TOKEN and SLACK_CHANNEL_ID):
+        raise RuntimeError("Bot token mode needs SLACK_BOT_TOKEN & SLACK_CHANNEL_ID.")
+    payload = {
+        "channel": SLACK_CHANNEL_ID,
+        "text": message,
+        "unfurl_links": True,
+        "unfurl_media": True,
+        "username": SLACK_USERNAME,
+        "icon_emoji": SLACK_ICON_EMOJI,
+    }
+    r = requests.post(
+        "https://slack.com/api/chat.postMessage",
+        headers={
+            "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+            "Content-Type": "application/json;charset=utf-8",
+        },
+        data=json.dumps(payload).encode(),
+        timeout=10,
+    )
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Slack API error: {data.get('error')}")
+
+POST = post_via_bot_token if SLACK_BOT_TOKEN else post_via_webhook
+
+# ------------------------------------------------------------------
+# 5. MAIN LOOP
+# ------------------------------------------------------------------
 
 def main():
-    if not SLACK_WEBHOOK_URL:
-        raise RuntimeError("SLACK_WEBHOOK_URL env var not set – cannot post to Slack.")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    if not (SLACK_WEBHOOK_URL or SLACK_BOT_TOKEN):
+        raise RuntimeError("Configure SLACK_WEBHOOK_URL or bot credentials.")
 
     seen = load_seen()
     logging.info("Loaded %d GUIDs", len(seen))
 
     while True:
-        for feed_url in FEEDS:
-            try:
-                feed = fetch_feed(feed_url)
-            except Exception as e:
-                logging.warning("Feed %s failed: %s", feed_url, e)
-                continue
-
-            for entry in feed.entries:
-                guid = entry.get("id") or entry.get("link")
-                if not guid or guid in seen:
+        try:
+            for feed_url in FEEDS:
+                try:
+                    feed = fetch_feed(feed_url)
+                except Exception as e:
+                    logging.warning("Feed %s failed: %s", feed_url, e)
                     continue
 
-                matched, topics = article_matches(entry)
-                if matched:
+                for entry in feed.entries:
+                    guid = entry.get("id") or entry.get("link")
+                    if not guid or guid in seen:
+                        continue
+
+                    matched, topics = article_matches(entry)
+                    if not matched:
+                        seen.add(guid)
+                        continue
+
                     title = entry.get("title", "(no title)")
-                    link = entry.get("link", "")
-                    slack_msg = f"*{title}*\n{link}\n• topics: {', '.join(topics)}"
+                    link = original_link(entry)
+
+                    message = f"*{title}*\n{link}\n• topics: {', '.join(topics)}"
                     try:
-                        post_to_slack(slack_msg)
+                        POST(message)
                         logging.info("Posted: %s", title)
                     except Exception as e:
                         logging.error("Slack post failed: %s", e)
-                        continue  # don’t mark; retry later
+                        continue  # retry next loop
 
-                seen.add(guid)
-        save_seen(seen)
+                    seen.add(guid)
+
+            save_seen(seen)
+        except Exception as e:
+            logging.error("Unhandled exception in main loop: %s", e)
+
         try:
             time.sleep(POLL_INTERVAL)
         except KeyboardInterrupt:
-            logging.info("Shutting down.")
             break
 
 
