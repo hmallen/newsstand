@@ -157,6 +157,17 @@ def post_via_bot_token(message: str):
     if not data.get("ok"):
         raise RuntimeError(f"Slack API error: {data.get('error')}")
 
+def post_via_generic_webhook(url: str, payload, headers: dict | None = None, timeout: int = 10, as_json: bool = True):
+    h = dict(headers) if headers else {}
+    if as_json and not isinstance(payload, (str, bytes)):
+        h.setdefault("Content-Type", "application/json")
+        body = json.dumps(payload).encode()
+        r = requests.post(url, headers=h, data=body, timeout=timeout)
+    else:
+        r = requests.post(url, headers=h, data=payload, timeout=timeout)
+    r.raise_for_status()
+    return r
+
 POST = post_via_bot_token if SLACK_BOT_TOKEN else post_via_webhook
 
 # ------------------------------------------------------------------
