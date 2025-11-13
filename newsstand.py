@@ -49,48 +49,14 @@ SLACK_USERNAME: str           = os.getenv("SLACK_USERNAME", "news-bot")
 SLACK_ICON_EMOJI: str         = os.getenv("SLACK_ICON_EMOJI", ":police_car:")
 POLL_INTERVAL: int            = int(os.getenv("POLL_INTERVAL", 300))
 SEEN_FILE: Path               = Path(os.getenv("SEEN_FILE", "seen.json"))
-
-FEEDS: List[str] = [
-    "https://www.404media.co/feed",
-    "https://www.theguardian.com/us/rss",
-    "https://feeds.feedburner.com/policeone/all",
-    "https://www.govtech.com/rss",
-    "https://qz.com/feed",
-    "https://knowridge.com/feed/",
-    "https://www.ground.news/rss",
-    "https://news.google.com/rss/search?q=surveillance+OR+ALPR+OR+AI+law+enforcement&hl=en-US&gl=US&ceid=US:en",
-]
+CONFIG_FILE_ENV: str | None   = os.getenv("CONFIG_FILE")
+if not CONFIG_FILE_ENV:
+    raise RuntimeError("CONFIG_FILE environment variable must be set to a JSON config path.")
+CONFIG_FILE: Path             = Path(CONFIG_FILE_ENV)
 
 # ------------------------------------------------------------------
 # 2. TOPIC FEATURE BANK
 # ------------------------------------------------------------------
-FEATURES: Dict[str, List[str]] = {
-    "camera_surveillance": [
-        r"\bsurveillance\s+cameras?\b",
-        r"public\s+safety\s+cameras?",
-        r"camera\s+network",
-        r"video\s+analytics",
-        r"cctv", r"closed\s*circuit\s+television",
-    ],
-    "alpr": [
-        r"\balpr\b",
-        r"automatic\s+license\s+plate",
-        r"license\s+plate\s+(reader|recognition)",
-        r"plate\s+reader",
-        r"flock",
-        #r"flock\s+safety",
-        #r"flock\s+nova",
-    ],
-    "ai_policing": [
-        r"ai-enabled\s+(camera|surveillance|polic(ing|e))",
-        r"machine\s+learning\s+(camera|surveillance|polic(ing|e))",
-        r"predictive\s+policing",
-        r"algorithmic\s+policing",
-        r"\bAI\b[^\n]{0,60}?law\s+enforcement",
-        r"law\s+enforcement[^\n]{0,60}?\bAI\b",
-    ],
-}
-FEATURE_PATTERNS = {k: [re.compile(p, re.I) for p in v] for k, v in FEATURES.items()}
 
 # ------------------------------------------------------------------
 # 3. UTILITIES
@@ -107,13 +73,21 @@ def load_seen() -> set[str]:
 def save_seen(seen: set[str]):
     SEEN_FILE.write_text(json.dumps(sorted(seen)))
 
+def load_config() -> Tuple[List[str], Dict[str, List[str]]]:
+    data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    feeds = data.get("feeds")
+    features = data.get("features")
+    if not (isinstance(feeds, list) and isinstance(features, dict)):
+        raise ValueError("Invalid config: 'feeds' must be a list and 'features' must be an object")
+    return feeds, {str(k): list(v) for k, v in features.items()}
+
 def fetch_feed(url: str):
     return feedparser.parse(url)
 
-def article_matches(entry: dict) -> Tuple[bool, List[str]]:
+def article_matches(entry: dict, feature_patterns: Dict[str, List[re.Pattern]]) -> Tuple[bool, List[str]]:
     text = f"{entry.get('title', '')} {entry.get('summary', '')}"
     hits: List[str] = []
-    for topic, patterns in FEATURE_PATTERNS.items():
+    for topic, patterns in feature_patterns.items():
         if any(p.search(text) for p in patterns):
             hits.append(topic)
     return bool(hits), hits
@@ -198,9 +172,20 @@ def main():
     seen = load_seen()
     logging.info("Loaded %d GUIDs", len(seen))
 
+    feeds, features = load_config()
+    feature_patterns: Dict[str, List[re.Pattern]] = {k: [re.compile(p, re.I) for p in v] for k, v in features.items()}
+
     while True:
         try:
-            for feed_url in FEEDS:
+            try:
+                new_feeds, new_features = load_config()
+                feeds = new_feeds
+                features = new_features
+                feature_patterns = {k: [re.compile(p, re.I) for p in v] for k, v in features.items()}
+            except Exception as e:
+                logging.warning("Using previous config due to error: %s", e)
+
+            for feed_url in feeds:
                 try:
                     feed = fetch_feed(feed_url)
                 except Exception as e:
@@ -212,7 +197,7 @@ def main():
                     if not guid or guid in seen:
                         continue
 
-                    matched, topics = article_matches(entry)
+                    matched, topics = article_matches(entry, feature_patterns)
                     if not matched:
                         seen.add(guid)
                         continue
