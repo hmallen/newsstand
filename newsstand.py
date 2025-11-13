@@ -54,6 +54,16 @@ if not CONFIG_FILE_ENV:
     raise RuntimeError("CONFIG_FILE environment variable must be set to a JSON config path.")
 CONFIG_FILE: Path             = Path(CONFIG_FILE_ENV)
 
+def _env_flag(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
+
+USE_SLACK_WEBHOOK: bool   = _env_flag("USE_SLACK_WEBHOOK", True)
+USE_GENERIC_WEBHOOK: bool = _env_flag("USE_GENERIC_WEBHOOK", False)
+GENERIC_WEBHOOK_URL: str | None = os.getenv("GENERIC_WEBHOOK_URL")
+
 # ------------------------------------------------------------------
 # 2. TOPIC FEATURE BANK
 # ------------------------------------------------------------------
@@ -157,6 +167,17 @@ def post_via_bot_token(message: str):
     if not data.get("ok"):
         raise RuntimeError(f"Slack API error: {data.get('error')}")
 
+def post_via_generic_webhook(url: str, payload, headers: dict | None = None, timeout: int = 10, as_json: bool = True):
+    h = dict(headers) if headers else {}
+    if as_json and not isinstance(payload, (str, bytes)):
+        h.setdefault("Content-Type", "application/json")
+        body = json.dumps(payload).encode()
+        r = requests.post(url, headers=h, data=body, timeout=timeout)
+    else:
+        r = requests.post(url, headers=h, data=payload, timeout=timeout)
+    r.raise_for_status()
+    return r
+
 POST = post_via_bot_token if SLACK_BOT_TOKEN else post_via_webhook
 
 # ------------------------------------------------------------------
@@ -166,8 +187,14 @@ POST = post_via_bot_token if SLACK_BOT_TOKEN else post_via_webhook
 def main():
     logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(message)s")
 
-    if not (SLACK_WEBHOOK_URL or SLACK_BOT_TOKEN):
-        raise RuntimeError("Configure SLACK_WEBHOOK_URL or bot credentials.")
+    use_slack = USE_SLACK_WEBHOOK and bool(SLACK_WEBHOOK_URL or SLACK_BOT_TOKEN)
+    if USE_SLACK_WEBHOOK and not (SLACK_WEBHOOK_URL or SLACK_BOT_TOKEN):
+        logging.warning("USE_SLACK_WEBHOOK=true but Slack credentials missing; skipping Slack.")
+    if USE_GENERIC_WEBHOOK and not GENERIC_WEBHOOK_URL:
+        raise RuntimeError("USE_GENERIC_WEBHOOK=true but GENERIC_WEBHOOK_URL is not set.")
+    use_generic = USE_GENERIC_WEBHOOK and bool(GENERIC_WEBHOOK_URL)
+    if not (use_slack or use_generic):
+        raise RuntimeError("No outputs enabled. Set USE_SLACK_WEBHOOK=true with Slack credentials, or set USE_GENERIC_WEBHOOK=true and GENERIC_WEBHOOK_URL.")
 
     seen = load_seen()
     logging.info("Loaded %d GUIDs", len(seen))
@@ -207,11 +234,20 @@ def main():
                     logging.info("Found: %s (%s)", title, link)
 
                     message = f"*{title}*\n{link}\n• topics: {', '.join(topics)}"
-                    try:
-                        POST(message)
-                        logging.info("Posted: %s", title)
-                    except Exception as e:
-                        logging.error("Slack post failed: %s", e)
+                    ok = False
+                    if use_slack:
+                        try:
+                            POST(message)
+                            ok = True
+                        except Exception as e:
+                            logging.error("Slack post failed: %s", e)
+                    if use_generic:
+                        try:
+                            post_via_generic_webhook(GENERIC_WEBHOOK_URL, {"url": link, "keywords": topics})
+                            ok = True
+                        except Exception as e:
+                            logging.error("Generic webhook post failed: %s", e)
+                    if not ok:
                         continue  # retry next loop
 
                     seen.add(guid)
