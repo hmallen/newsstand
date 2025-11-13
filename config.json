@@ -1,0 +1,37 @@
+{
+  "feeds": [
+    "https://www.404media.co/feed",
+    "https://www.theguardian.com/us/rss",
+    "https://feeds.feedburner.com/policeone/all",
+    "https://www.govtech.com/rss",
+    "https://qz.com/feed",
+    "https://knowridge.com/feed/",
+    "https://www.ground.news/rss",
+    "https://news.google.com/rss/search?q=surveillance+OR+ALPR+OR+AI+law+enforcement&hl=en-US&gl=US&ceid=US:en"
+  ],
+  "features": {
+    "camera_surveillance": [
+      "\\bsurveillance\\s+cameras?\\b",
+      "public\\s+safety\\s+cameras?",
+      "camera\\s+network",
+      "video\\s+analytics",
+      "cctv",
+      "closed\\s*circuit\\s+television"
+    ],
+    "alpr": [
+      "\\balpr\\b",
+      "automatic\\s+license\\s+plate",
+      "license\\s+plate\\s+(reader|recognition)",
+      "plate\\s+reader",
+      "flock"
+    ],
+    "ai_policing": [
+      "ai-enabled\\s+(camera|surveillance|polic(ing|e))",
+      "machine\\s+learning\\s+(camera|surveillance|polic(ing|e))",
+      "predictive\\s+policing",
+      "algorithmic\\s+policing",
+      "\\bAI\\b[^\\n]{0,60}?law\\s+enforcement",
+      "law\\s+enforcement[^\\n]{0,60}?\\bAI\\b"
+    ]
+  }
+}
