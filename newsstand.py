@@ -24,6 +24,7 @@ import re
 import json
 import time
 import logging
+import calendar
 from pathlib import Path
 from typing import List, Dict, Tuple
 import sys
@@ -63,6 +64,7 @@ def _env_flag(name: str, default: bool) -> bool:
 USE_SLACK_WEBHOOK: bool   = _env_flag("USE_SLACK_WEBHOOK", True)
 USE_GENERIC_WEBHOOK: bool = _env_flag("USE_GENERIC_WEBHOOK", False)
 GENERIC_WEBHOOK_URL: str | None = os.getenv("GENERIC_WEBHOOK_URL")
+INITIAL_LOOKBACK_DAYS: int    = int(os.getenv("INITIAL_LOOKBACK_DAYS", 3))
 
 # ------------------------------------------------------------------
 # 2. TOPIC FEATURE BANK
@@ -211,6 +213,9 @@ def main():
                 feature_patterns = {k: [re.compile(p, re.I) for p in v] for k, v in features.items()}
             except Exception as e:
                 logging.warning("Using previous config due to error: %s", e)
+            apply_lookback = len(seen) == 0
+            if apply_lookback:
+                lookback_threshold = time.time() - INITIAL_LOOKBACK_DAYS * 86400
 
             for feed_url in feeds:
                 try:
@@ -223,6 +228,16 @@ def main():
                     guid = entry.get("id") or entry.get("link")
                     if not guid or guid in seen:
                         continue
+
+                    if apply_lookback:
+                        ts_struct = entry.get("published_parsed") or entry.get("updated_parsed")
+                        if not ts_struct:
+                            seen.add(guid)
+                            continue
+                        entry_ts = calendar.timegm(ts_struct)
+                        if entry_ts < lookback_threshold:
+                            seen.add(guid)
+                            continue
 
                     matched, topics = article_matches(entry, feature_patterns)
                     if not matched:
